@@ -1,6 +1,7 @@
 #include <signal.h>
 #include <dirent.h>
 #include <glob.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/types.h>
@@ -26,7 +27,15 @@ char *getValidCmdPath(char *cmd, struct pathelement *pathEnv);
 
 void printFileContents(char *file);
 
-void waitWithTimeout(int pid, int *status, int timeout);
+void waitWithTimeout(int timeout);
+
+int isBackgroundProcess(char *argv[], int *argc);
+
+int startRedirection(char *argv[], int *argc, int noclobber, char **type);
+
+void endRedirection(char *type);
+
+void dupFds(int fd, char *type);
 
 void whichCommand(char *argv[], int argc, struct pathelement *pathEnv);
 
@@ -46,5 +55,7 @@ void printenvCommand(char *argv[], int argc);
 
 void setenvCommand(char *argv[], int argc, struct pathelement **pathEnv);
 
-void executeExternalCommand(char *argv[], int argc, struct pathelement *pathEnv, int timeout);
+void noclobberCommand(int *noclobber);
+
+void executeExternalCommand(char *argv[], int *argc, struct pathelement *pathEnv, int timeout, int noclobber);
 

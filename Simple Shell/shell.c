@@ -1,5 +1,8 @@
 #include "shell.h"
 
+int fgPid = -1;
+int fgStatus;
+
 int main(int mainc, char **mainv)
 {
 	char  *prefix = (char *)malloc(sizeof(char) * MAXPREF);
@@ -10,6 +13,7 @@ int main(int mainc, char **mainv)
 	// Timeout is in seconds but will be converted to microseconds for use.
 	// If atoi fails, it will return 0 and timeout will be set to 0 anyways.
 	int timeout = (mainc > 1) ? atoi(mainv[1]) : 0;
+	int noclobber = 0;
 	int shouldExit = 0;
 	int currentIgnoreEOFCount = 1;
 
@@ -17,6 +21,7 @@ int main(int mainc, char **mainv)
 	strcpy(prevDir, "");
 
 	signal(SIGINT, signalHandler);
+	signal(SIGCHLD, signalHandler);
 	signal(SIGTSTP, SIG_IGN);
 	signal(SIGTERM, SIG_IGN);
 
@@ -124,10 +129,14 @@ int main(int mainc, char **mainv)
 		{
 			printf("Executing built-in 'setenv' command.\n");
 			setenvCommand(argv, argc, &pathEnv);
-		}	
+		}
+		else if (strcmp(argv[0], "noclobber") == 0)
+		{
+			noclobberCommand(&noclobber);
+		}
 		else
 		{
-			executeExternalCommand(argv, argc, pathEnv, timeout);
+			executeExternalCommand(argv, &argc, pathEnv, timeout, noclobber);
 		}
 
 		for (int i = 0; i < argc; i++)
@@ -151,10 +160,21 @@ int main(int mainc, char **mainv)
 
 void signalHandler(int sig)
 {
-	// I do not need to do anything in here. By using this
-	// signal handler instead of SIG_IGN for SIGINT, ^C will
-	// be ignored in the parent process and propogated to
-	// the child process.
+	if (sig == SIGCHLD)
+	{
+		int pid, status;
+
+		if ((pid = waitpid(-1, &status, WNOHANG)) < 0)
+		{
+			perror("External command encountered a waitpid error");
+		}
+
+		if (pid == fgPid)
+		{
+			fgStatus = status;
+			fgPid = -1;
+		}
+	}
 }
 
 void printPrompt(char *prefix, char *buffer)
@@ -365,48 +385,147 @@ void printFileContents(char *file)
 	}
 }
 
-void waitWithTimeout(int pid, int *status, int timeout)
+void waitWithTimeout(int timeout)
 {
         // This is in microseconds.
         float timeBetweenChecks = 100000;
         float currentTimeout = 0;
-        int   outcome = 0;
 
         while (1)
         {
-                if ((outcome = waitpid(pid, status, WNOHANG)) == 0)
-                {
-                        usleep(timeBetweenChecks);
-                        currentTimeout += timeBetweenChecks;
-                }
-                else if (outcome > 0)
-                {
-                        break;
-                }
-                else
-                {
-                        perror("External command encountered a waitpid error");
-                }
+		usleep(timeBetweenChecks);
+		currentTimeout += timeBetweenChecks;
 
-                // I need to convert timout to microseconds since the
+                // I need to convert timeout to microseconds since the
                 // currentTimeout is in microseconds.
-                if (currentTimeout >= (timeout * 1000000))
+		
+		// The shell will stop waiting if the foreground process
+		// terminates or if the process has a timeout and that
+		// timeout has been reached.
+		if (fgPid == -1)
+		{
+			break;
+		}
+		else if (timeout != 0 && currentTimeout >= (timeout * 1000000))
                 {
-                        kill(pid, SIGINT);
-
-                        // I must use waitpid one last time to ensure that the
-                        // child does not turn into a zombie.
-                        if ((outcome = waitpid(pid, status, 0)) < 0)
-                        {
-                                perror("External command encountered a waitpid error");
-                        }
-			
-			printf("External command took too long to execute. Exiting...\n");
+			printf("External command took to long.\n");
+                        kill(fgPid, SIGINT);
                         break;
 		}
         }
 }
 
+int isBackgroundProcess(char *argv[], int *argc)
+{
+	if (*argc > 1 && strcmp(argv[*argc - 1], "&") == 0)
+	{
+		(*argc)--;
+		free(argv[*argc]);
+		argv[*argc] = NULL;
+
+		return 1;
+	}
+
+	return 0;
+}
+
+int startRedirection(char *argv[], int *argc, int noclobber, char **type)
+{
+	if (*argc > 2)
+	{
+		char *redirType = argv[*argc - 2];
+		char *fileName = argv[*argc - 1];
+
+		if (strcmp(redirType, "<") == 0 && access(fileName, F_OK) != 0)
+		{
+			printf("%s: File does not exist.\n", fileName);
+			return -1;
+		}
+
+		if (strcmp(redirType, "<") != 0 && access(fileName, F_OK) == 0 && noclobber)
+		{
+			printf("%s: Cannot overwrite existing file.\n", fileName);
+			return -1;
+		}
+
+		int fd;
+
+		if (strcmp(redirType, ">") == 0 || strcmp(redirType, ">&") == 0)
+		{
+			fd = open(fileName, O_WRONLY | O_CREAT | O_TRUNC, 0644);	
+		}
+		else if (strcmp(redirType, ">>") == 0 || strcmp(redirType, ">>&") == 0)
+		{
+			fd = open(fileName, O_WRONLY | O_CREAT | O_APPEND, 0644);
+		}
+		else if (strcmp(redirType, "<") == 0)
+		{
+			fd = open(fileName, O_RDONLY, 0644);
+		}
+		else
+		{
+			return 0;
+		}
+
+		dupFds(fd, redirType);
+
+		*type = malloc(sizeof(char) * strlen(redirType) + 1);
+		strncpy(*type, redirType, strlen(redirType));
+		(*type)[strlen(redirType)] = '\0';
+
+		free(argv[*argc - 1]);
+		argv[*argc - 1] = NULL;
+		free(argv[*argc - 2]);
+		argv[*argc - 2] = NULL;
+		(*argc) -= 2;
+		
+		return 1;
+	}
+
+	return 0;
+}
+
+void endRedirection(char *type)
+{
+	if (type != NULL)
+	{
+		int fd;
+
+		if (strcmp(type, "<") == 0)
+		{
+			fd = open("/dev/tty", O_RDONLY);
+		}
+		else
+		{
+			fd = open("/dev/tty", O_WRONLY);
+		}
+
+		dupFds(fd, type);
+
+		free(type);
+	}
+}
+
+void dupFds(int fd, char *type)
+{
+	if (strcmp(type, ">") == 0 || strcmp(type, ">>") == 0)
+        {
+		close(1);
+	}
+	else if (strcmp(type, ">&") == 0 || strcmp(type, ">>&") == 0)
+	{
+		close(1);
+		dup(fd);
+		close(2);
+	}
+	else                
+	{
+		close(0);
+	}
+
+	dup(fd);
+	close(fd);
+}
 
 void whichCommand(char *argv[], int argc, struct pathelement *pathEnv)
 {
@@ -659,7 +778,13 @@ void setenvCommand(char *argv[], int argc, struct pathelement **pathEnv)
 	}
 }
 
-void executeExternalCommand(char *argv[], int argc, struct pathelement *pathEnv, int timeout)
+void noclobberCommand(int *noclobber)
+{
+	*noclobber = ! (*noclobber);
+	printf("noclobber is now %s.\n", (*noclobber) ? "set" : "unset");
+}
+
+void executeExternalCommand(char *argv[], int *argc, struct pathelement *pathEnv, int timeout, int noclobber)
 {
 	char *path = getValidCmdPath(argv[0], pathEnv);
 
@@ -669,13 +794,20 @@ void executeExternalCommand(char *argv[], int argc, struct pathelement *pathEnv,
 
 	printf("Executing '%s'.\n", argv[0]);
 
-	int pid, status;
+	int isBgProcess = isBackgroundProcess(argv, argc);
+	char *redirType = NULL;
+	
+	if (! isBgProcess && startRedirection(argv, argc, noclobber, &redirType) < 0)
+	{
+		free(path);
+		return;
+	}
 
-	if ((pid = fork()) < 0)
+	if ((fgPid = fork()) < 0)
 	{
 		perror("External command encountered a fork error");
 	}
-	else if (pid == 0)
+	else if (fgPid == 0)
 	{
 		execve(path, argv, __environ);
 		perror("External command could not execute");
@@ -683,22 +815,17 @@ void executeExternalCommand(char *argv[], int argc, struct pathelement *pathEnv,
 	}
 
 	// Anything after here will only be executed by the parent.
-	if (timeout <= 0)
+	if (! isBgProcess)
 	{
-		if ((pid = waitpid(pid, &status, 0)) < 0)
-		{
-			perror("External command encountered a waitpid error");
-		}
-	}
-	else
-	{
-		waitWithTimeout(pid, &status, timeout);
+		waitWithTimeout(timeout);
+		endRedirection(redirType);
 	}
 
-	if (WIFEXITED(status))
+	if(WIFEXITED(fgStatus))
 	{
-		printf("Command '%s' had an exit status of [%d].\n", argv[0], WEXITSTATUS(status));
+		printf("Command [%s] had an exit status of [%d].\n", argv[0], WEXITSTATUS(fgStatus));
 	}
+
 
 	free(path);
 }
